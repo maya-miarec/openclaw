@@ -112,32 +112,10 @@ function parseSlackCommandArgValue(raw?: string | null): {
   };
 }
 
-type SlackApprovalDecision = "approve" | "reject";
-
-function inferSlackApprovalDecision(raw?: string | null): SlackApprovalDecision | null {
-  const normalized = (raw ?? "").trim().toLowerCase();
-  if (!normalized) {
-    return null;
-  }
-  if (normalized.includes("approve")) {
-    return "approve";
-  }
-  if (normalized.includes("reject") || normalized.includes("deny")) {
-    return "reject";
-  }
-  return null;
-}
-
-function resolveSlackApprovalSessionKey(params: {
+function resolveSlackUiSessionKey(params: {
   channelId?: string;
   threadTs?: string;
-  sessionKeyFromValue?: string;
 }): string {
-  const sessionKeyFromValue = params.sessionKeyFromValue?.trim();
-  if (sessionKeyFromValue?.startsWith("agent:main:")) {
-    return sessionKeyFromValue;
-  }
-
   const channelId = params.channelId?.trim() ?? "";
   const threadTs = params.threadTs?.trim() ?? "";
 
@@ -152,28 +130,62 @@ function resolveSlackApprovalSessionKey(params: {
   return threadTs ? `${base}:thread:${threadTs}` : base;
 }
 
-function buildSlackApprovalContextKey(params: {
+function buildSlackUiContextKey(params: {
   requestId?: string;
   threadTs?: string;
   channelId?: string;
   actionTs?: string;
 }): string {
-  return `slack:approval:${params.requestId || params.threadTs || params.channelId || "unknown"}:${params.actionTs ?? "na"}`;
+  return `slack:ui:${params.requestId || params.threadTs || params.channelId || "unknown"}:${params.actionTs ?? "na"}`;
 }
 
-function buildSlackApprovalEventText(params: {
-  decision: SlackApprovalDecision;
-  requestId?: string;
+function extractSlackUiRequestId(action: {
+  value?: string;
+  selected_option?: { value?: string };
+  selected_options?: Array<{ value?: string }>;
+}): { requestId?: string; valueSnippet?: string } {
+  const candidates: string[] = [];
+  if (typeof action.value === "string" && action.value.trim()) {
+    candidates.push(action.value.trim());
+  }
+  if (typeof action.selected_option?.value === "string" && action.selected_option.value.trim()) {
+    candidates.push(action.selected_option.value.trim());
+  }
+  for (const option of action.selected_options ?? []) {
+    if (typeof option?.value === "string" && option.value.trim()) {
+      candidates.push(option.value.trim());
+    }
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as { requestId?: string; request_id?: string };
+      const requestId = (parsed.requestId ?? parsed.request_id ?? "").trim();
+      if (requestId) {
+        return { requestId, valueSnippet: candidate };
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return { requestId: undefined, valueSnippet: candidates[0] };
+}
+
+function buildSlackUiEventText(params: {
+  requestId: string;
   actorId?: string;
   actionId?: string;
-  actionValue?: string;
+  actionType?: string;
+  valueSnippet?: string;
 }): string {
   return [
-    `Slack approval decision: ${params.decision.toUpperCase()}`,
-    params.requestId ? `request_id: ${params.requestId}` : null,
+    "Slack UI action",
+    `request_id: ${params.requestId}`,
     params.actorId ? `actor: ${params.actorId}` : null,
     params.actionId ? `action_id: ${params.actionId}` : null,
-    params.actionValue ? `value: ${params.actionValue}` : null,
+    params.actionType ? `action_type: ${params.actionType}` : null,
+    params.valueSnippet ? `value: ${params.valueSnippet}` : null,
   ]
     .filter(Boolean)
     .join("\n");
@@ -628,47 +640,29 @@ export function registerSlackMonitorSlashCommands(params: {
         action: NonNullable<(typeof ctx.app & { action?: unknown })["action"]>;
       }
     ).action(
-      /^(maya_approval_|openclaw_approval_|approval_)/,
+      /^(maya_ui_|maya_approval_|openclaw_approval_|approval_)/,
       async (args: SlackActionMiddlewareArgs) => {
         const { ack, body, respond } = args;
         const action = args.action as {
           action_id?: string;
-          value?: string;
           action_ts?: string;
+          type?: string;
+          value?: string;
+          selected_option?: { value?: string };
+          selected_options?: Array<{ value?: string }>;
         };
 
         await ack();
 
-        const actionId = action.action_id?.trim().toLowerCase() ?? "";
-        const actionValue = action.value?.trim() ?? "";
+        const actionId = action.action_id?.trim() ?? "";
+        const actionType = action.type?.trim() ?? "";
+        const requestData = extractSlackUiRequestId(action);
+        const requestId = requestData.requestId;
 
-        let decision = inferSlackApprovalDecision(actionId);
-        let requestId = "";
-        let sessionKeyFromValue = "";
-
-        if (actionValue) {
-          try {
-            const parsed = JSON.parse(actionValue) as {
-              decision?: string;
-              action?: string;
-              requestId?: string;
-              request_id?: string;
-              sessionKey?: string;
-              session_key?: string;
-            };
-            decision =
-              decision ?? inferSlackApprovalDecision(parsed.decision) ?? inferSlackApprovalDecision(parsed.action);
-            requestId = (parsed.requestId ?? parsed.request_id ?? "").trim();
-            sessionKeyFromValue = (parsed.sessionKey ?? parsed.session_key ?? "").trim();
-          } catch {
-            decision = decision ?? inferSlackApprovalDecision(actionValue);
-          }
-        }
-
-        if (!decision) {
+        if (!requestId) {
           if (respond) {
             await respond({
-              text: "Unsupported approval action.",
+              text: "Missing request_id in action payload.",
               response_type: "ephemeral",
             });
           }
@@ -684,23 +678,22 @@ export function registerSlackMonitorSlashCommands(params: {
           (body as { container?: { message_ts?: string } }).container?.message_ts ??
           "";
         const actorId = body.user?.id?.trim() ?? "unknown";
-        const sessionKey = resolveSlackApprovalSessionKey({
+        const sessionKey = resolveSlackUiSessionKey({
           channelId,
           threadTs,
-          sessionKeyFromValue,
         });
 
         enqueueSystemEvent(
-          buildSlackApprovalEventText({
-            decision,
+          buildSlackUiEventText({
             requestId,
             actorId,
             actionId,
-            actionValue,
+            actionType,
+            valueSnippet: requestData.valueSnippet,
           }),
           {
             sessionKey,
-            contextKey: buildSlackApprovalContextKey({
+            contextKey: buildSlackUiContextKey({
               requestId,
               threadTs,
               channelId,
@@ -708,26 +701,18 @@ export function registerSlackMonitorSlashCommands(params: {
             }),
           },
         );
-        requestHeartbeatNow({ reason: "slack-approval-action" });
-
-        const confirmation = decision === "approve" ? "✅ Approved received." : "❌ Rejected received.";
-        if (respond) {
-          await respond({
-            text: confirmation,
-            response_type: "ephemeral",
-          });
-        }
+        requestHeartbeatNow({ reason: "slack-ui-action" });
 
         if (channelId) {
           try {
             await ctx.app.client.chat.postMessage({
               token: ctx.botToken,
               channel: channelId,
-              text: confirmation,
+              text: `request_id: ${requestId}`,
               thread_ts: threadTs || undefined,
             });
           } catch (err) {
-            runtime.error?.(danger(`slack approval post failed: ${String(err)}`));
+            runtime.error?.(danger(`slack ui post failed: ${String(err)}`));
           }
         }
       },

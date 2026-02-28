@@ -19,7 +19,10 @@ import { resolveConversationLabel } from "../../channels/conversation-label.js";
 import { createReplyPrefixOptions } from "../../channels/reply-prefix.js";
 import { resolveNativeCommandsEnabled, resolveNativeSkillsEnabled } from "../../config/commands.js";
 import { resolveMarkdownTableMode } from "../../config/markdown-tables.js";
+import { resolveMainSessionKeyFromConfig } from "../../config/sessions/main-session.js";
 import { danger, logVerbose } from "../../globals.js";
+import { requestHeartbeatNow } from "../../infra/heartbeat-wake.js";
+import { enqueueSystemEvent } from "../../infra/system-events.js";
 import { buildPairingReply } from "../../pairing/pairing-messages.js";
 import {
   readChannelAllowFromStore,
@@ -107,6 +110,85 @@ function parseSlackCommandArgValue(raw?: string | null): {
     value: decodedValue,
     userId: decodedUserId,
   };
+}
+
+function resolveSlackUiSessionKey(params: {
+  channelId?: string;
+  threadTs?: string;
+}): string {
+  const channelId = params.channelId?.trim() ?? "";
+  const threadTs = params.threadTs?.trim() ?? "";
+
+  if (channelId.toUpperCase().startsWith("D")) {
+    return threadTs ? `agent:main:main:thread:${threadTs}` : resolveMainSessionKeyFromConfig();
+  }
+
+  const kind = channelId.toUpperCase().startsWith("C") ? "channel" : "group";
+  const base = channelId
+    ? `agent:main:slack:${kind}:${channelId.toLowerCase()}`
+    : resolveMainSessionKeyFromConfig();
+  return threadTs ? `${base}:thread:${threadTs}` : base;
+}
+
+function buildSlackUiContextKey(params: {
+  requestId?: string;
+  threadTs?: string;
+  channelId?: string;
+  actionTs?: string;
+}): string {
+  return `slack:ui:${params.requestId || params.threadTs || params.channelId || "unknown"}:${params.actionTs ?? "na"}`;
+}
+
+function extractSlackUiRequestId(action: {
+  value?: string;
+  selected_option?: { value?: string };
+  selected_options?: Array<{ value?: string }>;
+}): { requestId?: string; valueSnippet?: string } {
+  const candidates: string[] = [];
+  if (typeof action.value === "string" && action.value.trim()) {
+    candidates.push(action.value.trim());
+  }
+  if (typeof action.selected_option?.value === "string" && action.selected_option.value.trim()) {
+    candidates.push(action.selected_option.value.trim());
+  }
+  for (const option of action.selected_options ?? []) {
+    if (typeof option?.value === "string" && option.value.trim()) {
+      candidates.push(option.value.trim());
+    }
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as { requestId?: string; request_id?: string };
+      const requestId = (parsed.requestId ?? parsed.request_id ?? "").trim();
+      if (requestId) {
+        return { requestId, valueSnippet: candidate };
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return { requestId: undefined, valueSnippet: candidates[0] };
+}
+
+function buildSlackUiEventText(params: {
+  requestId: string;
+  actorId?: string;
+  actionId?: string;
+  actionType?: string;
+  valueSnippet?: string;
+}): string {
+  return [
+    "Slack UI action",
+    `request_id: ${params.requestId}`,
+    params.actorId ? `actor: ${params.actorId}` : null,
+    params.actionId ? `action_id: ${params.actionId}` : null,
+    params.actionType ? `action_type: ${params.actionType}` : null,
+    params.valueSnippet ? `value: ${params.valueSnippet}` : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function buildSlackCommandArgMenuBlocks(params: {
@@ -550,6 +632,91 @@ export function registerSlackMonitorSlashCommands(params: {
     );
   } else {
     logVerbose("slack: slash commands disabled");
+  }
+
+  if (typeof (ctx.app as { action?: unknown }).action === "function") {
+    (
+      ctx.app as unknown as {
+        action: NonNullable<(typeof ctx.app & { action?: unknown })["action"]>;
+      }
+    ).action(
+      /^(maya_ui_|maya_approval_|openclaw_approval_|approval_)/,
+      async (args: SlackActionMiddlewareArgs) => {
+        const { ack, body, respond } = args;
+        const action = args.action as {
+          action_id?: string;
+          action_ts?: string;
+          type?: string;
+          value?: string;
+          selected_option?: { value?: string };
+          selected_options?: Array<{ value?: string }>;
+        };
+
+        await ack();
+
+        const actionId = action.action_id?.trim() ?? "";
+        const actionType = action.type?.trim() ?? "";
+        const requestData = extractSlackUiRequestId(action);
+        const requestId = requestData.requestId;
+
+        if (!requestId) {
+          if (respond) {
+            await respond({
+              text: "Missing request_id in action payload.",
+              response_type: "ephemeral",
+            });
+          }
+          return;
+        }
+
+        const channelId = body.channel?.id?.trim() ?? "";
+        const threadTs =
+          (body as { container?: { thread_ts?: string; message_ts?: string }; message?: { thread_ts?: string; ts?: string } })
+            .container?.thread_ts ??
+          (body as { message?: { thread_ts?: string; ts?: string } }).message?.thread_ts ??
+          (body as { message?: { ts?: string } }).message?.ts ??
+          (body as { container?: { message_ts?: string } }).container?.message_ts ??
+          "";
+        const actorId = body.user?.id?.trim() ?? "unknown";
+        const sessionKey = resolveSlackUiSessionKey({
+          channelId,
+          threadTs,
+        });
+
+        enqueueSystemEvent(
+          buildSlackUiEventText({
+            requestId,
+            actorId,
+            actionId,
+            actionType,
+            valueSnippet: requestData.valueSnippet,
+          }),
+          {
+            sessionKey,
+            contextKey: buildSlackUiContextKey({
+              requestId,
+              threadTs,
+              channelId,
+              actionTs: action.action_ts,
+            }),
+          },
+        );
+        requestHeartbeatNow({ reason: "slack-ui-action" });
+
+        if (channelId) {
+          try {
+            await ctx.app.client.chat.postMessage({
+              token: ctx.botToken,
+              channel: channelId,
+              text: `request_id: ${requestId}`,
+              thread_ts: threadTs || undefined,
+            });
+          } catch (err) {
+            runtime.error?.(danger(`slack ui post failed: ${String(err)}`));
+          }
+        }
+      },
+    );
   }
 
   if (nativeCommands.length === 0 || !supportsInteractiveArgMenus) {
